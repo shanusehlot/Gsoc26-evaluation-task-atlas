@@ -1,42 +1,75 @@
-# ATLAS Performance Monitoring & Anomaly Detection
+# ATLAS Software Performance Monitoring – GSoC 2026 Evaluation
 
-This project satisfies the GSoC 2026 evaluation task for the CERN-HSF ATLAS Automated Software Performance Monitoring project. It provides a native performance monitoring pipeline optimized for macOS (Apple Silicon).
+This is my submission for the warm-up exercise for the CERN-HSF GSoC 2026 project on automated software performance monitoring for the ATLAS experiment.
 
-## Project Overview
+The task was to generate real process-level time-series data using a monitoring tool, inject anomalies, and apply an automated method to detect them.
 
-The system consists of three main components:
-1. A process monitor that captures time-series resource usage (CPU, Memory, I/O).
-2. A burner tool that generates configurable workloads to simulate typical ATLAS job behaviors.
-3. An anomaly detection script that identifies performance deviations using machine learning.
+---
 
-## How to Run
+## Structure
 
-Install the required dependencies:
-```bash
+```
+atlas_monitor/
+├── burner.py
+├── prmon_native.py
+├── anomaly_detection.py
+├── data/
+│   ├── normal_mem.csv
+│   └── anomaly_mem.csv
+└── plots/
+    └── anomaly_detection.png
+```
+
+`burner.py` generates a controlled memory workload. Pass it a size and duration and it allocates that memory and holds it for the run.
+
+`prmon_native.py` monitors a subprocess and records RSS memory, CPU, and I/O at 0.5-second intervals. Standard `prmon` relies on `/proc` and does not run on macOS, so this script uses `psutil` instead, which gives the same metrics on Apple Silicon.
+
+`anomaly_detection.py` loads the two CSVs, combines them into a single labeled time series, runs Isolation Forest on the RSS column, and saves the result to `plots/`.
+
+---
+
+## How to run
+
+```
 pip install psutil pandas scikit-learn matplotlib
 ```
 
-Run the automated pipeline (generates data and performs analysis):
-```bash
-python3 atlas_monitor/prmon_native.py --cmd "python3 atlas_monitor/burner.py --mode mem --duration 12 --size 20" --out atlas_monitor/data/normal_mem.csv
-python3 atlas_monitor/prmon_native.py --cmd "python3 atlas_monitor/burner.py --mode mem --duration 12 --size 80" --out atlas_monitor/data/anomaly_mem.csv
+```
+python3 atlas_monitor/prmon_native.py \
+  --cmd "python3 atlas_monitor/burner.py --mode mem --duration 12 --size 20" \
+  --out atlas_monitor/data/normal_mem.csv
+
+python3 atlas_monitor/prmon_native.py \
+  --cmd "python3 atlas_monitor/burner.py --mode mem --duration 12 --size 80" \
+  --out atlas_monitor/data/anomaly_mem.csv
+
 python3 atlas_monitor/anomaly_detection.py
 ```
 
-## Approach and Implementation
+---
 
-Since the standard `prmon` tool is Linux-specific (relying on /proc), this implementation uses a native Python monitor built on `psutil`. This allows for accurate tracking of Proportional Set Size (RSS) and CPU cycles on macOS arm64.
+## Results
 
-The anomaly detection uses an Isolation Forest algorithm. I chose this approach because it is highly effective at identifying outliers in time-series data without needing to define complex statistical thresholds manually. It treats the performance metrics as a multi-dimensional space and isolates points that are "few and far between."
+Both runs lasted 12 seconds, sampled every 0.5 seconds, giving 24 data points each and 48 total.
 
-## Analysis of Results
+The 20MB run forms a flat baseline. The 80MB run sits clearly above it. Isolation Forest was set with a contamination rate of 0.1, meaning it was told to expect about 10% of points to be anomalous.
 
-The generated plots show the memory footprint of a process under normal versus high-load conditions. The red markers indicate points where the memory usage deviated significantly from the "normal" baseline observed in the first half of the dataset.
+It flagged 4 points, all from the 80MB run. Precision was 100% — no false alarms. Recall was 16.6% — it caught the most extreme part of the spike but not the whole block.
 
-Trade-offs:
-- Using Python provides high portability and quick iteration but introduces slightly more overhead than the C++ original.
-- The monitoring interval is set to 0.5s to balance resolution with system stability on the M1 Pro.
+Overall accuracy across all 48 samples was around 58%. That number looks low, but it reflects a deliberate choice: the algorithm was configured for a scenario where anomalies are rare. In a real monitoring system, true anomalies are infrequent, so a contamination of 0.1 is a reasonable starting point. Raising it improves recall but introduces false alarms.
 
-## AI Disclosure
+---
 
-I used Claude (via Antigravity) to assist with the code structure, dependency management on macOS, and documentation design. The core logic and monitoring strategy were developed through iterative prompt engineering to meet the specific CERN-HSF requirements.
+## Why Isolation Forest
+
+Isolation Forest partitions data randomly and measures how quickly each point gets isolated. Points far from the main cluster get isolated in fewer splits, so they score as anomalies. It does not assume any particular distribution, which matters because memory usage patterns in ATLAS pipelines are not guaranteed to be Gaussian.
+
+The alternative I considered was a Z-score threshold. For a simple two-regime dataset like this one, Z-score would likely catch the entire 80MB block since it sits several standard deviations above the mean. The trade-off is that Z-score is fragile when the baseline drifts or when anomalies appear gradually rather than as a sharp spike. Isolation Forest handles those cases better, at the cost of being harder to interpret and tune.
+
+For a production ATLAS monitoring system, you would want to tune the contamination parameter against real incident history, or use an adaptive threshold that adjusts as the baseline evolves over time.
+
+---
+
+## AI disclosure
+
+I used Claude (Anthropic) for code generation and script structure. The choice of algorithm, parameter values, and interpretation of results are my own. All code was reviewed and tested before inclusion.
